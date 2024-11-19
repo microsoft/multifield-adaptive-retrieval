@@ -1,33 +1,38 @@
 # Project
 
-> This repo has been populated by an initial template to help get you started. Please
-> make sure to update the content to build a great experience for community-building.
+This is the repository for Multi-field Adaptive Retrieval (mFAR).
 
-As the maintainer of this project, please make a few updates:
+## Data processing
 
-- Improving this README.MD file to provide a great experience
-- Updating SUPPORT.MD with content about this project's support experience
-- Understanding the security reporting process in SECURITY.MD
-- Remove this section from the README
+Use the official library (`stark-qa`) to download the data. To test the download or to create a smaller, truncated version of the dataset, use the optional `--max_docs` argument. `dataset_name` can be `mag`, `prime`, or `amazon`.
+
+```
+python stark_to_trec.py --dataset_name prime --out $TMP_DIR [--max_docs 2000]
+python download_queries.py --dataset_name prime --out $TMP_DIR [--max_docs 2000]
+```
 
 ## Contributing
 
-This project welcomes contributions and suggestions.  Most contributions require you to agree to a
-Contributor License Agreement (CLA) declaring that you have the right to, and actually do, grant us
-the rights to use your contribution. For details, visit https://cla.opensource.microsoft.com.
+See CONTRIBUTING.md
 
-When you submit a pull request, a CLA bot will automatically determine whether you need to provide
-a CLA and decorate the PR appropriately (e.g., status check, comment). Simply follow the instructions
-provided by the bot. You will only need to do this once across all repos using our CLA.
+## Citation
 
-This project has adopted the [Microsoft Open Source Code of Conduct](https://opensource.microsoft.com/codeofconduct/).
-For more information see the [Code of Conduct FAQ](https://opensource.microsoft.com/codeofconduct/faq/) or
-contact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additional questions or comments.
+```
+@misc{li2024multifieldadaptiveretrieval,
+      title={Multi-Field Adaptive Retrieval},
+      author={Millicent Li and Tongfei Chen and Benjamin Van Durme and Patrick Xia},
+      year={2024},
+      eprint={2410.20056},
+      archivePrefix={arXiv},
+      primaryClass={cs.IR},
+      url={https://arxiv.org/abs/2410.20056},
+}
+```
 
 ## Trademarks
 
-This project may contain trademarks or logos for projects, products, or services. Authorized use of Microsoft 
-trademarks or logos is subject to and must follow 
+This project may contain trademarks or logos for projects, products, or services. Authorized use of Microsoft
+trademarks or logos is subject to and must follow
 [Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/en-us/legal/intellectualproperty/trademarks/usage/general).
 Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
 Any use of third-party trademarks or logos are subject to those third-party's policies.
