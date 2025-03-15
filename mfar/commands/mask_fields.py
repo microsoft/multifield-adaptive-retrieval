@@ -9,7 +9,7 @@ from pytorch_lightning.loggers import WandbLogger
 import pytorch_lightning as pl
 from pytorch_lightning.strategies import DDPStrategy
 
-from mfar.modeling.util import prepare_model
+from mfar.modeling.util import prepare_model, read_and_create_indices
 from mfar.data.util import MLFlowLoggerWrapper
 from mfar.modeling.contrastive import RetrievalDataModule, \
     RetrievalTrainingModule
@@ -74,10 +74,19 @@ def main(*,
         normalize=normalize,
         with_decoder=False,
     )
+
+    corpus_contents, vectors_dict, indices_dict = read_and_create_indices(
+        f"{corpus}/corpus",
+        dataset_name,
+        field_info,
+        temp_dir,
+        encoder,
+    )
+
     data_module = RetrievalDataModule(
         tokenizer=tokenizer,
         queries_path=queries,
-        corpus_path=corpus,
+        corpus=corpus_contents,
         dataset_name=dataset_name,
         temp_path=temp_dir,
         dev_partition=partition,
@@ -89,6 +98,7 @@ def main(*,
         train_max_length=train_max_length,
         dev_max_length=dev_max_length,
         field_info=field_info,
+        indices_dict=indices_dict,
         prefix=prefix,
         trec_val_freq=trec_val_freq,
     )
@@ -97,14 +107,16 @@ def main(*,
     checkpoint_suffix = best_ckpt.read().strip().split("/")[-1]
     checkpoint_path = f"{checkpoint_dir}/{checkpoint_suffix}"
     print(f"PATH IS: {checkpoint_path}")
+
     module = RetrievalTrainingModule.load_from_checkpoint(
         checkpoint_path,
-        corpus_path=f"{corpus}/corpus",
+        corpus=corpus_contents,
+        indices_dict=indices_dict,
+        vectors_dict=vectors_dict,
         dev_qrels_path=f"{queries}/{partition}.qrels",
         additional_qrels_path=f"{queries}/{additional_partition}.qrels" if additional_partition else None,
         encoder=encoder,
         field_info=field_info,
-        temp_dir=temp_dir,
         out_dir=out,
     )
 

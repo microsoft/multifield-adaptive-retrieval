@@ -3,6 +3,7 @@ from typing import *
 
 import os
 import time
+from mfar.data.typedef import FieldType
 import torch
 from fire import Fire
 from pytorch_lightning.loggers import WandbLogger
@@ -10,13 +11,16 @@ import pytorch_lightning as pl
 from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 
-from mfar.modeling.util import prepare_model
+from mfar.modeling.util import read_and_create_indices, prepare_model, read_sparse_scores
 from mfar.data.util import MLFlowLoggerWrapper
 from mfar.modeling.contrastive import RetrievalDataModule, \
     RetrievalTrainingModule
 
 from mfar.data.schema import resolve_fields
 import json
+
+import warnings
+warnings.filterwarnings("ignore", message=".*os.fork.*")
 
 def main(*,
          dataset_name: str,
@@ -27,8 +31,10 @@ def main(*,
          data: Optional[str]=None,
          queries: Optional[str]=None,
          corpus: Optional[str]=None,
+         sparse_scores_path: Optional[str]=None,
          additional_partition: Optional[str] = None,
          model_name: str = "facebook/contriever-msmarco",
+         model_path: Optional[str] = None,
          normalize: bool = False,
          temperature: float = 0.05,
          negative_sampling_params: Tuple[int, int, int] = (100, 50, 1),
@@ -63,6 +69,8 @@ def main(*,
 
     field_info = resolve_fields(field_names, dataset_name)
     field_info_string = json.dumps({k: v.__dict__() for k, v in field_info.items()})
+    has_sparse_fields = any(field.field_type == FieldType.SPARSE for field in field_info.values())
+
     if logger == "wandb":
         logger = WandbLogger(project=wandb_name, group=experiment_name, log_model=False, save_dir=wandb_dir)
     elif logger == "mlflow":
@@ -84,13 +92,14 @@ def main(*,
         queries = data
         corpus = data
     os.makedirs(out, exist_ok=True)
-
+    model_name = model_path if model_path else model_name
     print(
         f"""Starting training with the following experimental settings:
         - Model: {model_name}
         - Queries: {queries}
         - Corpus: {corpus}
         - Dataset name: {dataset_name}
+        - Sparse scores path: {sparse_scores_path}
         - Fields: {field_info_string}
         - Prefix: {prefix}
         - Query truncation: {train_max_length}
@@ -100,6 +109,7 @@ def main(*,
         - Test Set: {additional_partition}
         - Batch norm: {use_batchnorm}
         - Current time: {time.strftime("%Y-%m-%d %H:%M:%S")}
+        - Seed: {seed}
         """
     )
 
@@ -107,11 +117,30 @@ def main(*,
         model_name,
         normalize=normalize,
         with_decoder=False,
+        freeze_encoder=freeze_encoder,
     )
+
+    corpus_contents, vectors_dict, indices_dict = read_and_create_indices(
+        f"{corpus}/corpus",
+        dataset_name,
+        field_info,
+        temp_dir,
+        encoder,
+    )
+    print(f"Indices are created for all {len(indices_dict)} fields, including {field_info.keys()}")
+
+    if sparse_scores_path and has_sparse_fields:
+        start_time = time.time()
+        sparse_scores = read_sparse_scores(sparse_scores_path, field_info)
+        print(f"Finished reading sparse scores in {time.time() - start_time} seconds")
+    else:
+        sparse_scores = None
+
+
     data_module = RetrievalDataModule(
         tokenizer=tokenizer,
         queries_path=f"{queries}",
-        corpus_path=f"{corpus}",
+        corpus=corpus_contents,
         temp_path=temp_dir,
         dev_partition=partition,
         additional_partition=additional_partition,
@@ -123,6 +152,7 @@ def main(*,
         dev_max_length=dev_max_length,
         dataset_name=dataset_name,
         field_info=field_info,
+        indices_dict=indices_dict,
         prefix=prefix,
         trec_val_freq=trec_val_freq,
     )
@@ -134,14 +164,17 @@ def main(*,
         dev_qrels_path=f"{queries}/{partition}.qrels",
         additional_qrels_path=f"{queries}/{additional_partition}.qrels" if additional_partition else None,
         corpus_path=f"{corpus}/corpus",
+        sparse_scores=sparse_scores,
+        corpus=corpus_contents,
         dataset_name=dataset_name,
         encoder_learning_rate=encoder_lr,
         weights_learning_rate=weights_lr,
         weight_decay=regularizer,
         dev_batch_size=dev_batch_size,
-        temp_dir=temp_dir,
         out_dir=out,
         field_info=field_info,
+        indices_dict=indices_dict,
+        vectors_dict=vectors_dict,
         trec_val_freq=trec_val_freq,
         freeze_encoder=freeze_encoder,
         query_cond=query_cond,
@@ -187,7 +220,6 @@ def main(*,
     monitor = "valid_loss"
     mode = "min"
     filename = '{epoch}-{valid_loss:.3f}'
-
     trainer = pl.Trainer(
         callbacks=[
             EarlyStopping(

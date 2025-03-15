@@ -2,13 +2,13 @@ import pickle
 from functools import reduce
 from typing import Tuple, List, Optional, Union, TextIO, Dict
 import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import numpy as np
 import json
 import torch
 import torch.distributed
 import transformers
-from pathlib import Path
 from sentence_transformers import SentenceTransformer
 from torch.utils.data import DataLoader, DistributedSampler, Dataset
 
@@ -16,7 +16,7 @@ from transformers import PreTrainedTokenizer, PreTrainedModel
 import pytorch_lightning as pl
 
 from mfar.data import trec
-from mfar.data.index import DenseFlatIndex, BM25sSparseIndex, candidate_encoding_stream
+from mfar.data.index import Index, BM25sSparseIndex, candidate_encoding_stream
 from mfar.data.format import format_documents
 from mfar.data.negative_sampler import IndexNegativeSampler
 from mfar.data.typedef import Corpus, Field, FieldType
@@ -24,7 +24,6 @@ from mfar.data.dataset import (
     ContrastiveTrainingDataset, QueryDataset, Kind,
     InstanceBatch, DecomposedInstanceBatch, any_collate
 )
-from mfar.data.util import MemoryMapDict
 
 from mfar.modeling.losses import HybridContrastiveLoss
 from mfar.modeling.weighting import LinearWeights
@@ -34,7 +33,7 @@ class RetrievalDataModule(pl.LightningDataModule):
     def __init__(self,
                  tokenizer: PreTrainedTokenizer,
                  queries_path: str,
-                 corpus_path: str,
+                 corpus: List[Tuple[str, str]],
                  temp_path: str,
                  dev_partition: str,
                  additional_partition: Optional[str],
@@ -48,13 +47,14 @@ class RetrievalDataModule(pl.LightningDataModule):
                  dev_max_length: int = 512,
                  dim: int = 768,
                  field_info: Dict[str, Field] = None,
+                 indices_dict: Dict[str, Index] = None,
                  prefix: bool = False,
                  trec_val_freq: int = 0,
                  ):
         super().__init__()
         self.tokenizer = tokenizer
         self.queries_path = queries_path
-        self.corpus_path = corpus_path
+        self.corpus = corpus
         self.temp_path = temp_path
         self.dev_partition = dev_partition
         self.additional_partition = additional_partition
@@ -66,7 +66,7 @@ class RetrievalDataModule(pl.LightningDataModule):
 
         self._log_hyperparams = True
 
-        corpus = dict(trec.read_corpus(f"{self.corpus_path}/corpus"))
+        corpus = dict(corpus)
         self.documents = Corpus.from_docs_dict(corpus, dataset_name)
         self.negative_samplers = [IndexNegativeSampler(
             index=BM25sSparseIndex.load(f"{lexical_index}/single_sparse_sparse_index"),
@@ -83,6 +83,10 @@ class RetrievalDataModule(pl.LightningDataModule):
         self.prepare_data_per_node = True  # fdsp
         self.dim = dim
         self.field_info = field_info
+        # Optimization for dataloading
+        self.field_types = {field.field_type for field in field_info.values()}
+        self.indices_dict = indices_dict # This dict needs to be mutated by the training module during eval
+
         self.prefix = prefix
         self.trec_val_freq = trec_val_freq
         self.dev_queries_dict = dict(trec.read_corpus(f"{self.queries_path}/{self.dev_partition}.queries"))
@@ -104,12 +108,14 @@ class RetrievalDataModule(pl.LightningDataModule):
             tokenizer=self.tokenizer,
             queries=self.dev_queries_dict,
             max_length=self.query_max_length,
+            field_types=self.field_types,
         )
         self.additional_queries = [
             QueryDataset(
                 tokenizer=self.tokenizer,
                 queries=queries_dict,
                 max_length=self.query_max_length,
+                field_types=self.field_types,
             )
             for queries_dict in self.additional_queries_dict
         ]
@@ -123,6 +129,8 @@ class RetrievalDataModule(pl.LightningDataModule):
             negative_sampler=self.negative_samplers[0],
             max_length=self.train_max_length,
             field_info=self.field_info,
+            field_types=self.field_types,
+            indices_dict=self.indices_dict,
             prefix=self.prefix,
         )
         self.train = supervised
@@ -135,6 +143,8 @@ class RetrievalDataModule(pl.LightningDataModule):
             collate_fn=lambda instances: any_collate(dataset=self.train, instances=instances),
             sampler=sampler,
             batch_sampler=batch_sampler,
+            # num_workers=2,
+            # prefetch_factor=4,
         )
 
     def val_dataloader(self) -> List[DataLoader]:
@@ -147,19 +157,22 @@ class RetrievalDataModule(pl.LightningDataModule):
             negative_sampler=self.negative_samplers[0],
             max_length=self.dev_max_length,
             field_info=self.field_info,
+            field_types=self.field_types,
+            indices_dict=self.indices_dict,
             random_chunk=True,
         )
 
         sampler = DistributedSampler(self.dev)
         batch_sampler = None
         batch_size = self.dev_batch_size
-
         data_loaders.append(DataLoader(
             dataset=self.dev,
             batch_size=batch_size,
             collate_fn=lambda instances: any_collate(dataset=self.dev, instances=instances),
             sampler=sampler,
             batch_sampler=batch_sampler,
+            # num_workers=2,
+            # prefetch_factor=4,
         ))
 
         # Trec eval
@@ -169,6 +182,8 @@ class RetrievalDataModule(pl.LightningDataModule):
                 batch_size=self.dev_batch_size,
                 collate_fn=self.dev_queries.collate,
                 sampler=DistributedSampler(self.dev_queries),
+                # num_workers=2,
+                # prefetch_factor=4,
             ))
         else:
             data_loaders.append(DataLoader(dataset=[]))
@@ -201,16 +216,19 @@ class RetrievalTrainingModule(pl.LightningModule):
             model_id: str,
             decoder: Optional[PreTrainedModel],
             corpus_path: str,
+            corpus: List[Tuple[str, str]],
             dataset_name: str,
             dev_qrels_path: str,
-            temp_dir: str,
             out_dir: str,
+            sparse_scores: Optional[Dict] = None,
             contrastive_temp: float = 0.01,
             encoder_learning_rate: float = 1e-5,
             weights_learning_rate: Optional[float] = None,
             weight_decay: float = 0.0,
             dev_batch_size: int = 32,
             field_info: Dict = None,
+            indices_dict: Dict = None,
+            vectors_dict: Dict = None,
             trec_val_freq: int = 0,
             freeze_encoder: bool = False,
             query_cond: bool = True,
@@ -219,16 +237,20 @@ class RetrievalTrainingModule(pl.LightningModule):
             use_batchnorm: bool = False,
     ):
         super().__init__()
-        self.save_hyperparameters(ignore=['encoder'])
+        self.save_hyperparameters(ignore=['encoder', 'corpus', 'indices_dict', 'vectors_dict', 'precomputed_sparse_scores'])
         self.encoder = encoder
         self.model_id = model_id
         self.decoder = decoder
-        self.corpus_path = corpus_path
         self.dataset_name = dataset_name
-        self.corpus = list(trec.read_corpus(self.corpus_path))
+        self.corpus = corpus
+        self.corpus_path = corpus_path # used for reloading models
+        self.numeric_ids_to_keys = [x[0] for x in self.corpus]
+        self.keys_to_numeric_ids = {k: i for i, k in enumerate(self.numeric_ids_to_keys)}
 
         if field_info == None:
             raise NotImplementedError("No fields passed in!")
+        self.indices_dict = indices_dict
+        self.vectors_dict = vectors_dict
 
         self.automatic_optimization = False # We have two optimizers
         self.encoder_learning_rate = encoder_learning_rate
@@ -237,11 +259,7 @@ class RetrievalTrainingModule(pl.LightningModule):
         self.dev_batch_size = dev_batch_size
         self.dev_qrels_path = dev_qrels_path
         self.additional_qrels_path = additional_qrels_path
-        self.temp_dir = temp_dir  # for memmap
         self.out_dir = out_dir
-
-        self.numeric_ids_to_keys = [x[0] for x in self.corpus]
-        self.keys_to_numeric_ids = {k: i for i, k in enumerate(self.numeric_ids_to_keys)}
 
         self.n_docs = len(self.corpus)
         self.best_score = 0.0
@@ -255,35 +273,7 @@ class RetrievalTrainingModule(pl.LightningModule):
         if self.weights_learning_rate is None:
             raise ValueError(f"Need to specify a learning weight for the weights for {self.index_method}!")
 
-        if freeze_encoder:
-            for param in self.encoder.parameters():
-                param.requires_grad = False
 
-        self.vectors_dict = {}
-        self.indices_dict = {}
-        for field_key, field in field_info.items():
-            if field.field_type == FieldType.DENSE:
-                v_files = f"{self.temp_dir}/{field.name}.npy"
-                Path(v_files).parents[0].mkdir(parents=True, exist_ok=True)
-                # Create a file at the locations (somewhat hacky)
-                with open(v_files, 'w') as fp:
-                    pass
-                vectors = MemoryMapDict(
-                    v_files,
-                    keys=[x[0] for x in self.corpus],
-                    shape=(len(self.corpus), self.encoder.get_sentence_embedding_dimension()),
-                )  # shared across GPUs
-                self.vectors_dict[field_key] = vectors
-                self.indices_dict[field_key] = DenseFlatIndex(
-                    self.encoder,
-                    vectors.file,
-                    numeric_ids_to_keys=self.numeric_ids_to_keys,
-                    keys_to_numeric_ids=self.keys_to_numeric_ids,
-                )
-            elif field.field_type == FieldType.SPARSE:
-                formatted_docs = format_documents(self.corpus, field.name, field.dataset)
-                modified_field_name_docs = Corpus.from_docs_dict({item[0]: item[1] for item in formatted_docs})
-                self.indices_dict[field_key] = BM25sSparseIndex.create(modified_field_name_docs, dataset_name=self.dataset_name)
         num_fields = len(field_info)
         if query_cond:
             self.mixture_of_fields_layer = LinearWeights(
@@ -293,11 +283,11 @@ class RetrievalTrainingModule(pl.LightningModule):
             )
         else:
             self.mixture_of_fields_layer = LinearWeights(num_fields, 1)
-        sparse_indices_list = [self.indices_dict[field.key] for field in self.field_info.values() if field.field_type == FieldType.SPARSE]
+        sparse_indices_dict = {field.key: self.indices_dict[field.key] for field in self.field_info.values() if field.field_type == FieldType.SPARSE}
         self.hybrid_contrastive_loss_fn = HybridContrastiveLoss(
             temperature=contrastive_temp,
             mixture_of_fields_layer=self.mixture_of_fields_layer,
-            sparse_indices_list=sparse_indices_list,
+            sparse_indices_dict=sparse_indices_dict,
             num_fields = num_fields,
             use_batchnorm = use_batchnorm,
         )
@@ -305,13 +295,21 @@ class RetrievalTrainingModule(pl.LightningModule):
         self.qres_output: Optional[TextIO] = None
         self.additional_qres_output: Optional[TextIO] = None
 
+        # Unpack precomputed sparse scores to dicts
+        if sparse_scores:
+            self.precomputed_sparse_scores = sparse_scores
+        else:
+            print(f"Did not find precomputed sparse scores (e.g. if loading from checkpoint)")
+            self.precomputed_sparse_scores = {field_key: {} for field_key, field in self.field_info.items() if field.field_type == FieldType.SPARSE}
 
     def configure_optimizers(self) -> torch.optim.Optimizer:
         model_params = {
-            param_name: weight for param_name, weight in self.named_parameters() if "encoder" in param_name
+            param_name: weight for param_name, weight in self.named_parameters()
+            if "encoder" in param_name and weight.requires_grad
         }
         linear_params = {
-            param_name: weight for param_name, weight in self.named_parameters() if "mixture_of_fields_layer" in param_name or "bn" in param_name
+            param_name: weight for param_name, weight in self.named_parameters()
+            if ("mixture_of_fields_layer" in param_name or "bn" in param_name) and weight.requires_grad
         }
         # Hopefully this is all the parameters
         unused_params = {
@@ -356,18 +354,24 @@ class RetrievalTrainingModule(pl.LightningModule):
                     weight_decay=self.weight_decay,
                 )
             else:
-                encoder_optim = torch.optim.AdamW(
-                    model_params.values(),
-                    lr=self.encoder_learning_rate,
-                    weight_decay=self.weight_decay,
-                )
+                if len(model_params) == 0:
+                    return [torch.optim.AdamW(
+                        linear_params.values(),
+                        lr=self.weights_learning_rate,
+                    )]
+                else:
+                    encoder_optim = torch.optim.AdamW(
+                        model_params.values(),
+                        lr=self.encoder_learning_rate,
+                        weight_decay=self.weight_decay,
+                    )
 
-                linear_optim = torch.optim.AdamW(
-                    linear_params.values(),
-                    lr=self.weights_learning_rate,
-                )
+                    linear_optim = torch.optim.AdamW(
+                        linear_params.values(),
+                        lr=self.weights_learning_rate,
+                    )
 
-                return [encoder_optim, linear_optim]
+                    return [encoder_optim, linear_optim]
 
     def forward(self, batch: DecomposedInstanceBatch) -> torch.Tensor:
         x_encoded = self.encoder(batch.query)["sentence_embedding"]  # R[Batch, Emb]
@@ -381,23 +385,33 @@ class RetrievalTrainingModule(pl.LightningModule):
             device: torch.device, dataloader_idx: int
     ) -> DecomposedInstanceBatch:
         if batch.mode == Kind.QUERY:
-            query = super().transfer_batch_to_device(batch.query, device=device, dataloader_idx=dataloader_idx)
-            return InstanceBatch(batch.mode, query=query, pos_cand=None, neg_cands=None, instances=batch.instances)
+            query = super().transfer_batch_to_device(batch.query[FieldType.DENSE], device=device, dataloader_idx=dataloader_idx)
+            return InstanceBatch(batch.mode,
+                                 query={FieldType.DENSE: query},
+                                 pos_cand=None,
+                                 neg_cands=None,
+                                 instances=batch.instances)
         elif batch.mode == Kind.HYBRID:
             query, pos_cand, neg_cands = super().transfer_batch_to_device(
-                (batch.query, batch.pos_cand, batch.neg_cands),
+                (batch.query[FieldType.DENSE], batch.pos_cand[FieldType.DENSE], batch.neg_cands[FieldType.DENSE]),
                 device=device, dataloader_idx=dataloader_idx
             )
-            return DecomposedInstanceBatch(batch.mode, query, pos_cand, neg_cands, instances=batch.instances)
+            return DecomposedInstanceBatch(
+                batch.mode,
+                {FieldType.DENSE: query},
+                {FieldType.DENSE: pos_cand},
+                {FieldType.DENSE: neg_cands},
+                instances=batch.instances
+            )
         else:
             raise ValueError(f"Unknown batch type: {batch}")
 
     def encode_for_training(self, batch: InstanceBatch) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        x_encoded = self.encoder(batch.query)["sentence_embedding"]
+        x_encoded = self.encoder(batch.query[FieldType.DENSE])["sentence_embedding"]
         dense_fields = [field.key for field in self.field_info.values() if field.field_type == FieldType.DENSE]
         if dense_fields:
-            x_pos = [self.encoder(batch.pos_cand[field_key])["sentence_embedding"] for field_key in dense_fields]
-            x_neg = [self.encoder(batch.neg_cands[field_key])["sentence_embedding"] for field_key in dense_fields]
+            x_pos = [self.encoder(batch.pos_cand[FieldType.DENSE][field_key])["sentence_embedding"] for field_key in dense_fields]
+            x_neg = [self.encoder(batch.neg_cands[FieldType.DENSE][field_key])["sentence_embedding"] for field_key in dense_fields]
             x_pos_encoded = torch.stack(x_pos, dim=1)
             x_neg_encoded = torch.stack(x_neg, dim=1)
         else:
@@ -410,22 +424,33 @@ class RetrievalTrainingModule(pl.LightningModule):
 
     def compute_loss(self, batch: InstanceBatch, x_encoded: torch.Tensor, x_pos_encoded: torch.Tensor, x_neg_encoded: torch.Tensor) -> torch.Tensor:
         # Dims need to be: R[Batch, n_fields, Emb] for x_pos_encoded and R[Batch, n_fields, NegSample, Emb] for x_neg_encoded
-        # always use hybrid loss fn now but scores scores can be empty?
-        # TODO fix this hack
         queries = [batch.instances[idx].query.text for idx in range(len(batch.instances))]
         any_field_key = list(self.field_info.keys())[0]
+        query_ids = [int(batch.instances[idx].query._id) for idx in range(len(batch.instances))]
         pos_docs = [batch.instances[idx].pos_cand[any_field_key][0] for idx in range(len(batch.instances))]
         neg_docs = [batch.instances[idx].neg_cands[any_field_key][0][0] for idx in range(len(batch.instances))] # Assume only one negative
         queries = pickle.dumps(queries)
         pos_docs = pickle.dumps(pos_docs)
         neg_docs = pickle.dumps(neg_docs)
-        loss = self.hybrid_contrastive_loss_fn(x_encoded, queries, x_pos_encoded, pos_docs, x_neg_encoded, neg_docs)
+        query_ids = pickle.dumps(query_ids)
+        loss = self.hybrid_contrastive_loss_fn(
+            x_encoded,
+            queries,
+            x_pos_encoded,
+            pos_docs,
+            x_neg_encoded,
+            neg_docs,
+            query_ids,
+            self.precomputed_sparse_scores
+        )
         return loss
 
     def training_step(self, batch: InstanceBatch, batch_idx: int) -> torch.Tensor:
-        opt_enc, opt_reg = tuple(self.optimizers())
-        opt_enc.zero_grad()
-        opt_reg.zero_grad()
+        opts = self.optimizers()
+        if type(opts) is not list:
+            opts = [opts]
+        for opt in opts:
+            opt.zero_grad()
         x_encoded, x_pos_encoded, x_neg_encoded = self.encode_for_training(batch)
         loss_c = self.compute_loss(batch, x_encoded, x_pos_encoded, x_neg_encoded)
 
@@ -433,8 +458,8 @@ class RetrievalTrainingModule(pl.LightningModule):
             print(f"Training loss: {loss_c}")
         self.log("train_loss", loss_c.item(), on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True, batch_size=x_encoded.size(0))
         self.manual_backward(loss_c)
-        opt_enc.step()
-        opt_reg.step()
+        for opt in opts:
+            opt.step()
         return
 
     def on_eval_start(self) -> None:
@@ -444,8 +469,6 @@ class RetrievalTrainingModule(pl.LightningModule):
 
         corpus_segment = self.corpus[self.n_docs * rank // n: self.n_docs * (rank + 1) // n]
         dense_fields = [field.key for field in self.field_info.values() if field.field_type == FieldType.DENSE]
-        for dense_field_key in dense_fields:
-            del[self.indices_dict[dense_field_key]]
 
         all_field_name_docs = {
             field.key: format_documents(corpus_segment, field.name, field.dataset) for field in self.field_info.values()
@@ -456,7 +479,6 @@ class RetrievalTrainingModule(pl.LightningModule):
                     (_id, field.name + ": " + doc) for _id, doc in all_field_name_docs[field.key]
                 ] for field in self.field_info.values()
             }
-
         for dense_field_key in dense_fields:
             for key, vec in candidate_encoding_stream(
                 self.encoder,
@@ -466,16 +488,11 @@ class RetrievalTrainingModule(pl.LightningModule):
                 show_progress=False,
             ):
                 self.vectors_dict[dense_field_key][key] = vec
-
         torch.distributed.barrier()
         for dense_field_key in dense_fields:
-            self.indices_dict[dense_field_key] = DenseFlatIndex(
-                    self.encoder,
-                    self.vectors_dict[dense_field_key].file,
-                    numeric_ids_to_keys=self.numeric_ids_to_keys,
-                    keys_to_numeric_ids=self.keys_to_numeric_ids,
-                )
-        torch.distributed.barrier()
+            self.vectors_dict[dense_field_key].reopen()
+            self.indices_dict[dense_field_key].vectors = self.vectors_dict[dense_field_key].file
+        # Filter to only the fields we care about
         self.indices_dict = {k: self.indices_dict[k] for k in self.field_info.keys()}
 
 
@@ -617,6 +634,10 @@ class RetrievalTrainingModule(pl.LightningModule):
     def on_save_checkpoint(self, checkpoint):
         new_field_info = {field_name: field.serialize() for field_name, field in checkpoint["hyper_parameters"]["field_info"].items()}
         checkpoint["hyper_parameters"]["field_info"] = new_field_info
+        checkpoint["hyper_parameters"]["indices_list"] = []
+        checkpoint["hyper_parameters"]["vectors_list"] = []
+        checkpoint["hyper_parameters"]["corpus"] = []
+        checkpoint["hyper_parameters"]["precomputed_sparse_scores"] = []
 
     def on_load_checkpoint(self, checkpoint):
         new_field_info = {field_name: Field.deserialize(field) if isinstance(field, dict) else field
@@ -631,14 +652,18 @@ class RetrievalTrainingModule(pl.LightningModule):
         """
         Proxy step where we use the loss as the metric...
         """
-        batch = self.transfer_batch_to_device(batch, device=self.device, dataloader_idx=dataloader_idx)
         x_encoded, x_pos_encoded, x_neg_encoded = self.encode_for_training(batch)
         loss_c = self.compute_loss(batch, x_encoded, x_pos_encoded, x_neg_encoded)
         assert not loss_c.requires_grad
+        self.log("valid_loss", loss_c.item(), on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True, add_dataloader_idx=False)
         if torch.distributed.get_rank() == 0:
             print(f"Validation loss: {loss_c}")
-        self.log("valid_loss", loss_c.item(), on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True, add_dataloader_idx=False)
-
+            print(f"Cache information: BM25s tokenize: {BM25sSparseIndex.tokenize_single.cache_info()}")
+            index_memo = [f"{field_name}: {index.get_scores.cache_info()}"
+                            for field_name, index in self.indices_dict.items()
+                            if isinstance(index, BM25sSparseIndex)]
+            index_memo_str = index_memo[0] if index_memo else "None"
+            print(f"Cache information: BM25sSparseIndex index memo: {index_memo_str}")
         return loss_c
 
     def trec_eval_step(self, batch: QueryDataset, batch_idx: int, qres_output) -> None:
@@ -661,8 +686,8 @@ class RetrievalTrainingModule(pl.LightningModule):
             all_tens = all_tens * self.mask.cuda()
 
             q_toks = {
-                'input_ids': batch.query['input_ids'][i][:self.encoder.get_max_seq_length()].unsqueeze(0),
-                'attention_mask': batch.query['attention_mask'][i][:self.encoder.get_max_seq_length()].unsqueeze(0),
+                'input_ids': batch.query[FieldType.DENSE]['input_ids'][i][:self.encoder.get_max_seq_length()].unsqueeze(0),
+                'attention_mask': batch.query[FieldType.DENSE]['attention_mask'][i][:self.encoder.get_max_seq_length()].unsqueeze(0),
             }
 
             x_encoded = self.encoder(q_toks)["sentence_embedding"]

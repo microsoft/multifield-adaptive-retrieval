@@ -1,8 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor
 from itertools import chain
 from typing import Dict, Optional, List, Tuple
-
-from concurrent.futures import ThreadPoolExecutor
-
 
 import pickle
 import torch
@@ -21,9 +19,6 @@ class BaseContrastiveLoss(torch.nn.Module):
         multi_fields: bool = False,
     ):
         super().__init__()
-
-        # Needed for the stability of training
-        # See https://arxiv.org/pdf/2112.07899.pdf, Section 3.1 and Section 4.2
         self.temperature = temperature
         self.in_batch_negative = in_batch_negative
         self.reverse = reverse
@@ -63,7 +58,7 @@ class BaseContrastiveLoss(torch.nn.Module):
 
     def sliced_nll(self, scores, batch_size, gpu_id):
         log_probs = torch.log_softmax(scores, dim=1) # R[Batch, Devices*Batch + ...]
-        # This needs to be very careful that we get the correct diagonal
+        # Be careful to get the correct diagonal
         sliced_scores = log_probs[:, (batch_size * gpu_id): (batch_size * (gpu_id + 1))]  # R[Batch, Batch]
         log_probs = torch.diag(sliced_scores) # R[Batch]
         nll = -torch.mean(log_probs)
@@ -216,12 +211,12 @@ class HybridContrastiveLoss(DecomposedContrastiveLoss):
         reverse: bool = True,
         all_gather_multi_gpu: bool = True,
         mixture_of_fields_layer: torch.nn.Module = None,
-        sparse_indices_list: List = None,
+        sparse_indices_dict: Dict = None,
         num_fields: int = 0,
         use_batchnorm = False,
     ):
         super().__init__(temperature, in_batch_negative, reverse, all_gather_multi_gpu, mixture_of_fields_layer)
-        self.sparse_indices_list = sparse_indices_list
+        self.sparse_indices_dict = sparse_indices_dict
         if use_batchnorm:
             self.bn = torch.nn.BatchNorm1d(num_fields, track_running_stats=True) # need to try false
         else:
@@ -235,10 +230,12 @@ class HybridContrastiveLoss(DecomposedContrastiveLoss):
         pos_docs: List[str], # List[Batch]
         d_neg: Optional[torch.Tensor],  # R[Batch, Field, NegSample, Emb]
         neg_docs: Optional[List[str]], # List[Batch]
+        query_ids: List[int],
+        sparse_scores: Optional[Dict] = None,
     ) -> torch.Tensor:
         use_multi_gpu = self.all_gather_multi_gpu and torch.distributed.is_initialized()
         if self.in_batch_negative:
-            nll = self.in_batch_negative_loss(q, queries, d_pos, pos_docs, d_neg, neg_docs, use_multi_gpu)
+            nll = self.in_batch_negative_loss(q, queries, d_pos, pos_docs, d_neg, neg_docs, use_multi_gpu, query_ids, sparse_scores)
         else:
             nll = self.simple_loss(q, d_pos, d_neg)
         return self.distributed_reduce_mean_nll(nll, use_multi_gpu)
@@ -247,6 +244,7 @@ class HybridContrastiveLoss(DecomposedContrastiveLoss):
         self,
         q,
         queries,
+        query_ids,
         d_pos,
         pos_docs,
         d_neg,
@@ -263,28 +261,32 @@ class HybridContrastiveLoss(DecomposedContrastiveLoss):
             all_queries = [None for _ in range(torch.distributed.get_world_size())]
             all_pos_docs = [None for _ in range(torch.distributed.get_world_size())]
             all_neg_docs = [None for _ in range(torch.distributed.get_world_size())]
+            all_query_ids = [None for _ in range(torch.distributed.get_world_size())]
             torch.distributed.all_gather_object(all_queries, pickle.loads(queries))
             torch.distributed.all_gather_object(all_pos_docs, pickle.loads(pos_docs))
             torch.distributed.all_gather_object(all_neg_docs, pickle.loads(neg_docs))
+            torch.distributed.all_gather_object(all_query_ids, pickle.loads(query_ids))
             flattened_queries = list(chain(*all_queries))
             flattened_pos_docs = list(chain(*all_pos_docs))
             flattened_neg_docs = list(chain(*all_neg_docs))
-        return q, flattened_queries, d_pos, flattened_pos_docs, d_neg, flattened_neg_docs
+            flattened_query_ids = list(chain(*all_query_ids))
+        return q, flattened_queries, d_pos, flattened_pos_docs, d_neg, flattened_neg_docs, flattened_query_ids
 
-    def in_batch_negative_loss(self, q, queries, d_pos, pos_docs, d_neg, neg_docs, use_multi_gpu):
+    def in_batch_negative_loss(self, q, queries, d_pos, pos_docs, d_neg, neg_docs, use_multi_gpu, query_ids, sparse_scores):
         """
         q: [Batch, Emb]
         d_pos: [Batch, Emb] or [Batch, Field, Emb]
         d_neg: [Batch, NegSample, Emb] or [Batch, Field, NegSample, Emb]
         """
-        all_q, all_queries_text, all_d_pos, all_pos_ids, all_d_neg, all_neg_ids = self.gather_all_embeddings(
-            q, queries, d_pos, pos_docs, d_neg, neg_docs, use_multi_gpu
+        all_q, all_queries_text, all_d_pos, all_pos_ids, all_d_neg, all_neg_ids, all_query_ids = self.gather_all_embeddings(
+            q, queries, query_ids, d_pos, pos_docs, d_neg, neg_docs, use_multi_gpu
         )
 
         queries = pickle.loads(queries) # For gpu-specific use
+        query_ids = pickle.loads(query_ids)
         pos_docs = pickle.loads(pos_docs) # For gpu-specific use
         scores_pos, scores_neg = self.compute_query_doc_scores(
-            q, queries, all_d_pos, all_pos_ids, all_d_neg, all_neg_ids,
+            q, queries, all_d_pos, all_pos_ids, all_d_neg, all_neg_ids, query_ids, sparse_scores
         )
         all_scores = torch.cat([scores_pos, scores_neg], dim=1)  # R[Batch, Devices*Batch + ...]
 
@@ -293,7 +295,7 @@ class HybridContrastiveLoss(DecomposedContrastiveLoss):
         nll = self.sliced_nll(all_scores, per_device_batch_size, gpu_id)
 
         if self.reverse:
-            rev_scores = self.compute_doc_query_scores(d_pos, pos_docs, all_q, all_queries_text)
+            rev_scores = self.compute_doc_query_scores(d_pos, pos_docs, all_q, all_queries_text, all_query_ids, sparse_scores)
             rev_nll = self.sliced_nll(rev_scores, per_device_batch_size, gpu_id)
             nll += rev_nll
         return nll
@@ -301,14 +303,26 @@ class HybridContrastiveLoss(DecomposedContrastiveLoss):
     def compute_sparse_query_doc_scores(
         self,
         queries, #[QueryBatch]
-        text, #[Field, DocBatch]
+        doc_ids, # [DocBatch]
+        query_ids: List[int], # [QueryBatch]
+        sparse_scores: Optional[Dict],
     ): #-> R[QueryBatch, DocBatch * Devices, num_fields]:
-        if len(self.sparse_indices_list) > 0:
-            with ThreadPoolExecutor(max_workers=len(self.sparse_indices_list)) as executor:
-                per_field_scores = list(executor.map(lambda si: si.score_batch(queries, text), self.sparse_indices_list))
-            return torch.stack(per_field_scores, dim=-1).cuda() # R[QueryBatch, DocBatch * Devices, num_fields]
+        """
+        If we have scores saved in sparse_scores, then use that instead of calculating bm25 during the forward pass
+
+        However at dev/test-time, those scores do not exist and so we will need to expensively compute them.
+        """
+        if len(self.sparse_indices_dict) > 0:
+            if any([all([qid in sparse_score_by_field for qid in query_ids])
+                    for sparse_score_by_field in sparse_scores.values()]):
+                per_field_scores = [si.score_batch_with_cache(query_ids, doc_ids, sparse_scores[field_name])
+                                    for field_name, si in self.sparse_indices_dict.items()]
+            else:
+                with ThreadPoolExecutor(max_workers=len(self.sparse_indices_dict)) as executor:
+                    per_field_scores = list(executor.map(lambda si: si.score_batch(queries, doc_ids), self.sparse_indices_dict.values()))
+            return torch.stack(per_field_scores, dim=-1).cuda()
         else:
-            return torch.empty(len(queries), len(text), 0).cuda()
+            return torch.empty(len(queries), len(doc_ids), 0).cuda()
 
     def compute_query_doc_scores(
         self,
@@ -318,10 +332,12 @@ class HybridContrastiveLoss(DecomposedContrastiveLoss):
         pos_text, # R[Field, DocBatch]
         d_neg, # R [DocBatch, Field, NegSample, Emb]
         neg_text, # R[Field, DocBatch]
+        query_ids, # List[int]
+        sparse_scores, # Dict
     ):
         dense_scores_pos, dense_scores_neg = self.compute_query_doc_field_components(q, d_pos, d_neg)
-        sparse_scores_pos = self.compute_sparse_query_doc_scores(queries, pos_text)
-        sparse_scores_neg = self.compute_sparse_query_doc_scores(queries, neg_text)
+        sparse_scores_pos = self.compute_sparse_query_doc_scores(queries, pos_text, query_ids, sparse_scores)
+        sparse_scores_neg = self.compute_sparse_query_doc_scores(queries, neg_text, query_ids, sparse_scores)
 
         all_scores_pos = torch.cat([dense_scores_pos, sparse_scores_pos], dim=-1)
         all_scores_neg = torch.cat([dense_scores_neg, sparse_scores_neg], dim=-1)
@@ -333,11 +349,11 @@ class HybridContrastiveLoss(DecomposedContrastiveLoss):
         scores_neg = all_scores_combined[:, dense_scores_pos.size(1):]
         return scores_pos, scores_neg
 
-    def compute_doc_query_scores(self, d_pos, pos_docs, q, queries):
+    def compute_doc_query_scores(self, d_pos, pos_docs, q, queries, query_ids, sparse_scores):
         # There's some unnecessary transposes going on here... not going to touch that for now
         dense_rev_scores = torch.matmul(d_pos, q.t().unsqueeze(0)) / self.temperature # R[DocBatch, Field, Devices*QueryBatch]
         dense_rev_scores = dense_rev_scores.permute(2, 0, 1) #[Devices*QueryBatch, DocBatch, Field]
-        sparse_rev_scores = self.compute_sparse_query_doc_scores(queries, pos_docs) # R[QueryBatch * Devices, Doc_Batch, num_fields]
+        sparse_rev_scores = self.compute_sparse_query_doc_scores(queries, pos_docs, query_ids, sparse_scores) # R[QueryBatch * Devices, Doc_Batch, num_fields]
 
         all_scores = torch.concat([dense_rev_scores, sparse_rev_scores], dim=2) # R[QueryBatch * Devices, DocBatch, num_dense+num_sparse fields]
         all_scores = self.bn(all_scores.permute(0, 2, 1)).permute(0, 2, 1) # R[QueryBatch * Devices, DocBatch, num_dense+num_sparse fields]

@@ -1,26 +1,22 @@
 from typing import Iterable, Dict, Generic, Sequence, Tuple, TypeVar, Literal, List, Union, Optional, Any
 from abc import ABC, abstractmethod
 
+from functools import lru_cache
+
 import numpy as np
 import json
 import torch
 import bm25s
 
-from Stemmer import Stemmer
-
 from tqdm import tqdm
 from more_itertools import chunked
 from sentence_transformers import SentenceTransformer
 
-from more_itertools import chunked
-from sentence_transformers import SentenceTransformer
-from tqdm import tqdm
 from mfar.data.typedef import Corpus
 
 Key = TypeVar("Key")
 Query = TypeVar("Query")
 Vector = TypeVar("Vector")
-
 
 class Index(ABC, Generic[Key, Query]):
     """
@@ -45,49 +41,62 @@ class BM25sSparseIndex(Index[str, str]):
     A sparse index powered by BM25s (without Lucene/JVMs).
     """
 
-    def __init__(self, keys: List[str], index: bm25s.BM25, stemmer: Optional[Stemmer], index_limit: int = 5000):
+    def __init__(self, keys: List[str], index: bm25s.BM25, stemmer: Optional[Any], index_limit: int = 5000, safe_docs={}):
         self.keys = keys
         self.key_to_id = {key: i for i, key in enumerate(keys)}
         self.index = index
         self.stemmer = stemmer
-        self.index_memo = {}        # str -> Index thing
-        self.tokenization_memo = {} # str -> List[str]
         self.index_limit = index_limit
+        self.safe_docs = safe_docs
+        self.name = None
 
-    def tokenize_single(self, query, stopwords, stemmer, return_ids):
-        if query in self.tokenization_memo:
-            return self.tokenization_memo[(query, return_ids)]
+    def set_safe_docs(self, safe_docs):
+        self.safe_docs = safe_docs
+
+    @staticmethod
+    @lru_cache(maxsize=2**20)
+    def tokenize_single(
+            query: str,
+            stopwords: str,
+            stemmer: Optional[Any],
+            return_ids: bool = False
+        ) -> Union[List[str], Tuple[List[str], List[int]]]:
         tokens = bm25s.tokenize(query, stopwords=stopwords, stemmer=stemmer, return_ids=return_ids, show_progress=False)
-        if return_ids:
-            self.tokenization_memo[(query, return_ids)] = tokens
-        else:
-            self.tokenization_memo[(query, return_ids)] = tokens[0]
-        return self.tokenization_memo[(query, return_ids)]
+        return tokens if return_ids else tokens[0]
 
     def tokenize(self, queries, stopwords, stemmer, return_ids=True):
         if isinstance(queries, str):
-            return self.tokenize_single(queries, stopwords, stemmer, return_ids)
-        return [self.tokenize_single(query, stopwords, stemmer, return_ids) for query in queries]
+            return BM25sSparseIndex.tokenize_single(queries, stopwords, stemmer, return_ids)
+        return [BM25sSparseIndex.tokenize_single(query, stopwords, stemmer, return_ids) for query in queries]
 
+    @lru_cache(maxsize=2**15)
     def get_scores(self, query):
-        if query in self.index_memo:
-            return self.index_memo[query]
         query_tokens = self.tokenize(query, stopwords="en", stemmer=self.stemmer, return_ids=False)
         score = self.index.get_scores(query_tokens)
-        if len(self.index_memo) < 5000:
-            self.index_memo[query] = score
         return score
 
-    def retrieve(self, query: str, top_k: int) -> Sequence[Tuple[str, float]]:
+    def get_scores_sparse(self, query):
         query_tokens = self.tokenize(query, stopwords="en", stemmer=self.stemmer, return_ids=False)
-        results, scores = self.index.retrieve([query_tokens], k=top_k, show_progress=False)  # [Batch, Cand]
+        dense_scores = self.index.get_scores(query_tokens)
+        sparse_scores = {i: dense_scores[i] for i in range(len(dense_scores)) if dense_scores[i] != 0}
+        sparse_scores = {doc_id: score for doc_id, score in sparse_scores.items()
+                         if doc_id in self.safe_docs}
+        return sparse_scores
+
+    def retrieve(self, query: str, top_k: int) -> Sequence[Tuple[str, float]]:
+        """
+        Retrieve the top-k documents for the given query string
+        This essentially creates a batch with a single retrieval request and returns the results.
+        """
+        query_tokens = self.tokenize(query, stopwords="en", stemmer=self.stemmer, return_ids=False)
+        results, scores = self.index.retrieve([query_tokens], k=top_k, show_progress=False, backend_selection="numpy")  # [Batch, Cand]
         return [(self.keys[results[0, i]], scores[0, i]) for i in range(results.shape[1])]
 
     def retrieve_batch(
         self, queries: Sequence[str], top_k: int
     ) -> Sequence[Sequence[Tuple[str, float]]]:
         query_tokens = self.tokenize(queries, stopwords="en", stemmer=self.stemmer, return_ids=False)
-        results, scores = self.index.retrieve(query_tokens, k=top_k, show_progress=False)
+        results, scores = self.index.retrieve(query_tokens, k=top_k, show_progress=False, backend_selection="numpy")
         return [
             [(self.keys[results[i, j]], scores[i, j]) for j in range(results.shape[1])]
             for i in range(results.shape[0])
@@ -108,6 +117,13 @@ class BM25sSparseIndex(Index[str, str]):
         specified_doc_scores[:, neg_indices] = 0
         return torch.tensor(specified_doc_scores)
 
+    def score_batch_with_cache(self, query_ids: List[int], keys: Sequence[str], sparse_scores: Dict) -> np.ndarray:
+        all_doc_scores = [sparse_scores.get(qid, {}) for qid in query_ids]
+        doc_ids = [self.key_to_id[key] for key in keys]
+        specified_doc_scores = [[score_for_query.get(doc_id, 0) for doc_id in doc_ids]
+                                for score_for_query in all_doc_scores]
+        return torch.tensor(specified_doc_scores)
+
     def get_scores_with_dummy_check(self, func, default=None, *args, **kwargs):
         try:
             breakpoint()
@@ -116,7 +132,7 @@ class BM25sSparseIndex(Index[str, str]):
             return 0
 
     @classmethod
-    def create(cls, corpus: Corpus, stemmer: Optional[Stemmer] = None, dataset_name: Optional[str] = ""):
+    def create(cls, corpus: Corpus, stemmer: Optional[Any] = None, dataset_name: Optional[str] = ""):
         keys = list(corpus.keys())
         texts = [d.text for d in corpus.docs]
         index = bm25s.BM25(method="lucene", k1=1.2, b=0.75)
@@ -134,7 +150,7 @@ class BM25sSparseIndex(Index[str, str]):
             json.dump(self.keys, f)
 
     @classmethod
-    def load(cls, path: str, stemmer: Optional[Stemmer] = None):
+    def load(cls, path: str, stemmer: Optional[Any] = None):
         with open(f"{path}/keys.json", "r") as f:
             keys = json.load(f)
         index = bm25s.BM25.load(f"{path}/index", mmap=True)

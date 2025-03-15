@@ -15,12 +15,13 @@ STARK_DATASETS = ["mag", "prime", "amazon"]
 
 def main(*, dataset_name: str, out: str, max_docs: Optional[int] = None):
     print(f"Downloading queries for {dataset_name} to {out}, with max_docs={max_docs}.")
-    if max_docs is not None and int(max_docs) == -1:
-        max_docs = None
-        print(f"Setting max_docs to None")
-    else:
-        max_docs = int(max_docs)
-        print(f"Setting max_docs to {max_docs} (with boolean value {bool(max_docs)}).")
+    if max_docs is not None:
+        if int(max_docs) == -1:
+            max_docs = None
+            print(f"Setting max_docs to None")
+        else:
+            max_docs = int(max_docs)
+            print(f"Setting max_docs to {max_docs} (with boolean value {bool(max_docs)}).")
     qa: STaRKDataset = load_qa(name=dataset_name)
     for partition in ["train", "val", "test", "test-0.1"]:
         num_queries = 0

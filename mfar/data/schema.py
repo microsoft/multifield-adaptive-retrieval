@@ -2,11 +2,10 @@ from typing import List, Any, Dict, Tuple, Optional
 from mfar.data.typedef import Field, FieldType
 
 """
-The below are "presets" for all the fields They're basically the same as
-hyperparameters they're in the code rather than the bash/submission scripts.
-They are based on thresholds from the corpus.
+The below are "presets" for all the fields. They are based
+on thresholds from the corpus, codified here for reproducibility
+and version control.
 """
-WTB_CONSTANT=64
 SPARSE_MAX = 1048576
 
 MAG_FIELDS = [
@@ -53,6 +52,7 @@ AMAZON_FIELDS = [
     ("title", 128),
 ]
 
+# What's that book dataset: unused in paper.
 WTB_FIELDS = [
     ("author", 16),
     ("author_url", 64),
@@ -75,34 +75,29 @@ def generate_schema(FIELDS, dataset_name):
         fields[f"{field}_dense"] = Field(f"{field}_dense", field, FieldType.DENSE, max_seq_length, dataset=dataset_name)
     return fields
 
-DATASET_NAMES = ["mag", "prime", "amazon", "whatsthatbook"]
 FIELDS_DICT = {
     "mag": MAG_FIELDS,
     "prime": PRIME_FIELDS,
     "amazon": AMAZON_FIELDS,
     "whatsthatbook": WTB_FIELDS
 }
-
+DATASET_NAMES = list(FIELDS_DICT.keys())
 SCHEMAS = {name: generate_schema(FIELDS_DICT[name], name) for name in DATASET_NAMES}
 
 
 STARK_SCHEMAS = {}
-for dataset in ["mag", "amazon", "prime", "whatsthatbook"]:
+for dataset in DATASET_NAMES:
     STARK_SCHEMAS[dataset] = {
-        "single_sparse": Field("single_sparse", "single", FieldType.SPARSE, 99999, dataset),
+        "single_sparse": Field("single_sparse", "single", FieldType.SPARSE, SPARSE_MAX, dataset),
         "single_dense": Field("single_dense", "single", FieldType.DENSE, 512, dataset),
     }
 
 
 def resolve_fields(field_names: List[str], dataset: str) -> Dict[str, Field]:
-    if "mag" in dataset.split("/")[-1]:
-        dataset_name = "mag"
-    elif "amazon" in dataset.split("/")[-1]:
-        dataset_name = "amazon"
-    elif "whatsthatbook" in dataset.split("/")[-1]:
-        dataset_name = "whatsthatbook"
-    elif "prime" in dataset.split("/")[-1]:
-        dataset_name = "prime"
+    for valid_dataset in DATASET_NAMES:
+        if valid_dataset in dataset.split("/")[-1]:
+            dataset_name = valid_dataset
+            break
     else:
         raise NotImplementedError(f"Dataset {dataset} is not supported!")
 

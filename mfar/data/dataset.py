@@ -2,12 +2,13 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Tuple, Dict, Set, Optional, Union
 
+from mfar.data.index import Index
 from torch.utils.data import Dataset
 from transformers import BatchEncoding, PreTrainedTokenizer
 
 from mfar.data.format import format_documents
 from mfar.data.negative_sampler import NegativeSampler
-from mfar.data.typedef import Query, Document, Corpus
+from mfar.data.typedef import FieldType, Query, Document, Corpus
 from mfar.data import trec
 
 class Kind(Enum):
@@ -134,17 +135,19 @@ class DecomposedInstanceBatch:
     neg_cands: Optional[BatchEncoding] = None
     instances: List[Union[DecomposedInstance, Query]] = field(default_factory=list)
 
-
 class QueryDataset(Dataset[Query]):
     def __init__(self,
                  tokenizer: PreTrainedTokenizer,
                  queries: Dict[str, str],
                  max_length: int = 512,
+                 field_types: Set[FieldType] = None,
                  ):
         self.queries = queries
         self.tokenizer = tokenizer
         self.max_length = max_length # What do we use this for?
         self.ids = list(self.queries.keys())
+        self.field_types: Set[FieldType] = field_types
+        self.indices_dict: Dict
 
     def __len__(self):
         return len(self.queries)
@@ -159,17 +162,19 @@ class QueryDataset(Dataset[Query]):
 
     def collate(self,
                 instances: List[Query],
-                ) -> InstanceBatch:
+        ) -> InstanceBatch:
         texts = [instance.text for instance in instances]
-        encodings = self.tokenizer.batch_encode_plus(
+        query = {}
+        query[FieldType.DENSE] = self.tokenizer.batch_encode_plus(
             texts,
             max_length=self.max_length,
             padding='longest',
             return_tensors="pt",
         )
+
         return InstanceBatch(
             mode=Kind.QUERY,
-            query=encodings,
+            query=query,
             instances=instances
         )
 
@@ -183,6 +188,8 @@ class ContrastiveTrainingDataset(Dataset[Instance]):
                  num_neg_sample_per_layer: int = 0,
                  max_length: int = 384,
                  field_info: Dict = None,
+                 field_types: Set[FieldType] = None,
+                 indices_dict: Dict = None,
                  prefix: bool = False,
                  random_chunk: bool = True,
                  ):
@@ -203,12 +210,16 @@ class ContrastiveTrainingDataset(Dataset[Instance]):
                 self.pos_for_each_qid[qrel.query_id] = set()
             self.pos_for_each_qid[qrel.query_id].add(qrel.doc_id)
 
+        self.field_types = field_types
+        self.indices_dict = indices_dict
+
     def __len__(self):
         return len(self.qrels)
 
     def __getitem__(self, idx: int) -> Instance:
         qrel = self.qrels[idx]
         query = Query(qrel.query_id, self.queries[qrel.query_id])
+        # This was a temporary hack, sorry it is now permanent
         if len(query.text.strip()) < 5:
             query.text = "what"
         pos_cand = self.documents.get_doc_by_key(qrel.doc_id)
@@ -224,7 +235,7 @@ class ContrastiveTrainingDataset(Dataset[Instance]):
         )
 
     def collate(self,
-                instances: List[Instance]
+                instances: List[Instance],
                 ) -> InstanceBatch:
         def _batch_encode(sentences: List[str], max_length=self.max_length) -> BatchEncoding:
             return self.tokenizer.batch_encode_plus(
@@ -235,43 +246,52 @@ class ContrastiveTrainingDataset(Dataset[Instance]):
                 return_tensors="pt",
             )
 
-        query = _batch_encode([instance.query.text for instance in instances])
-        pos_cand = {
-            field.key: [
-                field.name.replace("___", " ") + ": " + instance.pos_cand[field.key][1]
-                if self.prefix else instance.pos_cand[field.key][1]
-                for instance in instances
-            ] for field in self.field_info.values()
-        }
+        query = {}
+        pos_cand = {}
+        neg_cands = {}
+        query[FieldType.DENSE] = _batch_encode([instance.query.text for instance in instances])
 
-        pos_cand_parts = {
-            field.key: _batch_encode(pos_cand[field.key], max_length=field.max_seq_length)
-            for field in self.field_info.values()
-        }
+        if FieldType.DENSE in self.field_types:
+            _pos_cand = {
+                field.key: [
+                    field.name.replace("___", " ") + ": " + instance.pos_cand[field.key][1]
+                    if self.prefix else instance.pos_cand[field.key][1]
+                    for instance in instances
+                ] for field in self.field_info.values()
+            }
 
-        neg_cands = {
-            field.key: [
-                field.name.replace("___", " ") + ": " + instance.neg_cands[field.key][0][1]
-                if self.prefix else instance.neg_cands[field.key][0][1]
-                for instance in instances
-            ] for field in self.field_info.values()
-        }
+            pos_cand[FieldType.DENSE] = {
+                field.key: _batch_encode(_pos_cand[field.key], max_length=field.max_seq_length)
+                for field in self.field_info.values()
+            }
 
-        neg_cands_parts = {
-            field.key: _batch_encode(neg_cands[field.key], max_length=field.max_seq_length)
-            for field in self.field_info.values()
-        }
+            _neg_cands = {
+                field.key: [
+                    field.name.replace("___", " ") + ": " + instance.neg_cands[field.key][0][1]
+                    if self.prefix else instance.neg_cands[field.key][0][1]
+                    for instance in instances
+                ] for field in self.field_info.values()
+            }
+
+            neg_cands[FieldType.DENSE] = {
+                field.key: _batch_encode(_neg_cands[field.key], max_length=field.max_seq_length)
+                for field in self.field_info.values()
+            }
+        else:
+            pos_cand[FieldType.DENSE] = []
+            neg_cands[FieldType.DENSE] = []
+
         return DecomposedInstanceBatch(
             mode=Kind.HYBRID,
             query=query,
-            pos_cand=pos_cand_parts,
-            neg_cands=neg_cands_parts,
+            pos_cand=pos_cand,
+            neg_cands=neg_cands,
             instances=instances
         )
 
 def any_collate(
     dataset: Dataset,
-    instances: List[Union[Instance, DecomposedInstance]]
+    instances: List[Union[Instance, DecomposedInstance]],
 ) -> Union[InstanceBatch, DecomposedInstanceBatch]:
     if isinstance(dataset, ContrastiveTrainingDataset):
         return dataset.collate(instances)

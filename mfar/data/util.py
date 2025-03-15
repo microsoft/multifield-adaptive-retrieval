@@ -55,6 +55,9 @@ class MemoryMapDict(MutableMapping[str, np.ndarray]):
     def close(self):
         self.file.flush()
 
+    def reopen(self):
+        self.file = np.memmap(self._path, dtype=self._dtype, mode="r+", shape=self._shape)
+
 
 def remove_irregularities(obj: Any) -> Any:
     """Ensures that the object is JSON-serializable."""
