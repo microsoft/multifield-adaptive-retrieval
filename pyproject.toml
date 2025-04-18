@@ -7,7 +7,7 @@ readme = "README.md"
 
 [tool.poetry.dependencies]
 python = ">=3.10,<3.12"
-torch = "^2.5.1"  # torch 1.13 has cuda linking issues when custom cuda is present on AzureML machines
+torch = "^2.6.0"  # torch 1.13 has cuda linking issues when custom cuda is present on AzureML machines
 tqdm = "^4.65.0"
 transformers = ">4.27.4" # This was exactly 4.27.4 because of mlflow related issues, check back on it later?
 datasets = "^2.11.0"
